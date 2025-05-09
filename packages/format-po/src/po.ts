@@ -1,11 +1,14 @@
 import { format as formatDate } from "date-fns"
-import PO from "pofile"
-
+import { po as poParser } from "gettext-parser"
+import type {
+  GetTextTranslations,
+  GetTextTranslationRecord,
+  GetTextTranslation,
+  GetTextComment,
+} from "gettext-parser"
 import { CatalogFormatter, CatalogType, MessageType } from "@lingui/conf"
 import { generateMessageId } from "@lingui/message-utils/generateMessageId"
 import { normalizePlaceholderValue } from "./utils"
-
-type POItem = InstanceType<typeof PO.Item>
 
 const splitOrigin = (origin: string) => {
   const [file, line] = origin.split(":")
@@ -110,7 +113,7 @@ function isGeneratedId(id: string, message: MessageType): boolean {
 function getCreateHeaders(
   language: string,
   customHeaderAttributes: PoFormatterOptions["customHeaderAttributes"]
-): PO["headers"] {
+): GetTextTranslations["headers"] {
   return {
     "POT-Creation-Date": formatDate(new Date(), "yyyy-MM-dd HH:mmxxxx"),
     "MIME-Version": "1.0",
@@ -125,57 +128,59 @@ function getCreateHeaders(
 const EXPLICIT_ID_FLAG = "js-lingui-explicit-id"
 const GENERATED_ID_FLAG = "js-lingui-generated-id"
 
-const serialize = (catalog: CatalogType, options: PoFormatterOptions) => {
-  return Object.keys(catalog).map((id) => {
+const serialize = (
+  catalog: CatalogType,
+  options: PoFormatterOptions
+): GetTextTranslationRecord => {
+  const translations: GetTextTranslationRecord = {}
+
+  Object.keys(catalog).forEach((id) => {
     const message: MessageType<POCatalogExtra> = catalog[id]
 
-    const item = new PO.Item()
+    const item: GetTextTranslation = {
+      msgid: "", // Will be set below
+      msgstr: [message.translation || ""], // Ensure msgstr is always an array, and provide empty string for null/undefined
+    }
 
-    // The extractedComments array may be modified in this method,
-    // so create a new array with the message's elements.
-    item.extractedComments = [
-      ...(message.comments?.length
-        ? splitMultiLineComments(message.comments)
-        : []),
-    ]
+    const comments: GetTextComment = {}
 
-    item.flags = ((message.extra?.flags || []) as string[]).reduce<
-      Record<string, boolean>
-    >((acc, flag) => {
-      acc[flag] = true
-      return acc
-    }, {})
+    // Extracted comments
+    const extractedComments: string[] = []
+    if (message.comments?.length) {
+      extractedComments.push(...splitMultiLineComments(message.comments))
+    }
 
     const _isGeneratedId = isGeneratedId(id, message)
 
     if (_isGeneratedId) {
-      item.msgid = message.message
+      item.msgid = message.message || "" // Ensure msgid is not undefined
 
       if (options.explicitIdAsDefault) {
-        if (!item.extractedComments.includes(GENERATED_ID_FLAG)) {
-          item.extractedComments.push(GENERATED_ID_FLAG)
+        if (!extractedComments.includes(GENERATED_ID_FLAG)) {
+          extractedComments.push(GENERATED_ID_FLAG)
         }
       }
 
       if (options.printLinguiId) {
-        if (!item.extractedComments.find((c) => c.includes("js-lingui-id"))) {
-          item.extractedComments.push(`js-lingui-id: ${id}`)
+        if (!extractedComments.find((c) => c.includes("js-lingui-id"))) {
+          extractedComments.push(`js-lingui-id: ${id}`)
         }
       }
     } else {
       if (!options.explicitIdAsDefault) {
-        if (!item.extractedComments.includes(EXPLICIT_ID_FLAG)) {
-          item.extractedComments.push(EXPLICIT_ID_FLAG)
+        if (!extractedComments.includes(EXPLICIT_ID_FLAG)) {
+          extractedComments.push(EXPLICIT_ID_FLAG)
         }
       }
-
       item.msgid = id
     }
 
     if (options.printPlaceholdersInComments !== false) {
-      item.extractedComments = item.extractedComments.filter(
+      const existingPlaceholderComments = extractedComments.filter(
         (comment) => !comment.startsWith("placeholder ")
       )
+      extractedComments.length = 0
+      extractedComments.push(...existingPlaceholderComments)
 
       const limit =
         typeof options.printPlaceholdersInComments === "object" &&
@@ -187,7 +192,7 @@ const serialize = (catalog: CatalogType, options: PoFormatterOptions) => {
         Object.entries(message.placeholders).forEach(([name, value]) => {
           if (/^\d+$/.test(name)) {
             value.slice(0, limit).forEach((entry) => {
-              item.extractedComments.push(
+              extractedComments.push(
                 `placeholder {${name}}: ${normalizePlaceholderValue(entry)}`
               )
             })
@@ -196,58 +201,108 @@ const serialize = (catalog: CatalogType, options: PoFormatterOptions) => {
       }
     }
 
+    if (extractedComments.length > 0) {
+      comments.extracted = extractedComments.join("\n")
+    }
+
+    // Translator comments
+    if (message.extra?.translatorComments?.length) {
+      comments.translator = splitMultiLineComments(
+        message.extra.translatorComments
+      ).join("\n")
+    }
+
+    // Origins (references)
+    if (options.origins !== false && message.origin?.length) {
+      const references = message.origin.map(
+        options.lineNumbers === false ? ([path]) => path : joinOrigin
+      )
+      if (references.length > 0) {
+        comments.reference = references.join("\n")
+      }
+    }
+
+    // Flags
+    if (message.extra?.flags?.length) {
+      comments.flag = message.extra.flags.join(" ")
+    }
+
+    if (Object.keys(comments).length > 0) {
+      item.comments = comments
+    }
+
     if (message.context) {
       item.msgctxt = message.context
     }
 
-    item.msgstr = [message.translation]
-    item.comments = message.extra?.translatorComments || []
-
-    if (options.origins !== false) {
-      if (message.origin && options.lineNumbers === false) {
-        item.references = message.origin.map(([path]) => path)
-      } else {
-        item.references = message.origin ? message.origin.map(joinOrigin) : []
-      }
+    if (message.obsolete) {
+      item.obsolete = true
     }
-    item.obsolete = message.obsolete
 
-    return item
+    const contextKey = item.msgctxt || ""
+    if (!translations[contextKey]) {
+      translations[contextKey] = {}
+    }
+    translations[contextKey][item.msgid] = item
   })
+
+  return translations
 }
 
 function deserialize(
-  items: POItem[],
+  translations: GetTextTranslationRecord,
   options: PoFormatterOptions
 ): CatalogType {
-  return items.reduce<CatalogType<POCatalogExtra>>((catalog, item) => {
-    const message: MessageType<POCatalogExtra> = {
-      translation: item.msgstr[0],
-      comments: item.extractedComments || [],
-      context: item.msgctxt ?? null,
-      obsolete: item.flags.obsolete || item.obsolete,
-      origin: (item.references || []).map((ref) => splitOrigin(ref)),
-      extra: {
-        translatorComments: item.comments || [],
-        flags: Object.keys(item.flags).map((flag) => flag.trim()),
-      },
+  const catalog: CatalogType<POCatalogExtra> = {}
+
+  for (const msgctxt in translations) {
+    const contextTranslations = translations[msgctxt]
+    for (const originalMsgId in contextTranslations) {
+      const item = contextTranslations[originalMsgId]
+
+      const comments = item.comments || {}
+      const extractedComments = comments.extracted
+        ? comments.extracted.split("\n")
+        : []
+      const translatorComments = comments.translator
+        ? comments.translator.split("\n")
+        : []
+      const flags = comments.flag ? comments.flag.split(" ") : []
+      const references = comments.reference
+        ? comments.reference.split("\n")
+        : []
+
+      const message: MessageType<POCatalogExtra> = {
+        translation: item.msgstr[0] || "", // Ensure translation is not undefined
+        comments: extractedComments,
+        context: item.msgctxt || null,
+        obsolete: item.obsolete || flags.includes("obsolete"), // `gettext-parser` might put obsolete in flags
+        origin: references.map((ref) => splitOrigin(ref)),
+        extra: {
+          translatorComments: translatorComments,
+          flags: flags.filter((f) => f !== "obsolete"), // Remove obsolete from flags if it was there
+        },
+      }
+
+      let id = item.msgid
+
+      if (
+        options.explicitIdAsDefault
+          ? extractedComments.includes(GENERATED_ID_FLAG)
+          : !extractedComments.includes(EXPLICIT_ID_FLAG)
+      ) {
+        id = generateMessageId(item.msgid, item.msgctxt)
+        message.message = item.msgid
+      }
+      // If it's an explicit ID, message.message is not set here,
+      // it's assumed that the ID itself is the message key/text.
+      // Or, if not, the user should ensure it's correctly handled in their workflow.
+      // The original code didn't explicitly set message.message for explicit IDs.
+
+      catalog[id] = message
     }
-
-    let id = item.msgid
-
-    // if generated id, recreate it
-    if (
-      options.explicitIdAsDefault
-        ? item.extractedComments.includes(GENERATED_ID_FLAG)
-        : !item.extractedComments.includes(EXPLICIT_ID_FLAG)
-    ) {
-      id = generateMessageId(item.msgid, item.msgctxt)
-      message.message = item.msgid
-    }
-
-    catalog[id] = message
-    return catalog
-  }, {})
+  }
+  return catalog
 }
 
 export function formatter(options: PoFormatterOptions = {}): CatalogFormatter {
@@ -262,27 +317,39 @@ export function formatter(options: PoFormatterOptions = {}): CatalogFormatter {
     templateExtension: ".pot",
 
     parse(content): CatalogType {
-      const po = PO.parse(content)
-      return deserialize(po.items, options)
+      const po = poParser.parse(content, { defaultCharset: "utf-8" })
+      return deserialize(po.translations, options)
     },
 
     serialize(catalog, ctx): string {
-      let po: PO
+      let headers = getCreateHeaders(ctx.locale, options.customHeaderAttributes)
+      const existingTranslations: GetTextTranslationRecord | undefined =
+        undefined
 
       if (ctx.existing) {
-        po = PO.parse(ctx.existing)
-      } else {
-        po = new PO()
-        po.headers = getCreateHeaders(
-          ctx.locale,
-          options.customHeaderAttributes
-        )
-        // accessing private property
-        ;(po as any).headerOrder = Object.keys(po.headers)
+        try {
+          const existingPo = poParser.parse(ctx.existing, {
+            defaultCharset: "utf-8",
+          })
+          headers = existingPo.headers // Prefer existing headers
+        } catch (e) {
+          console.warn(
+            "Failed to parse existing .po file, creating a new one.",
+            e
+          )
+        }
       }
 
-      po.items = serialize(catalog, options)
-      return po.toString()
+      const translations = serialize(catalog, options)
+
+      const poData: GetTextTranslations = {
+        charset: "utf-8",
+        headers: headers,
+        translations: translations,
+      }
+
+      const buffer = poParser.compile(poData, { sort: true })
+      return buffer.toString("utf-8")
     },
   }
 }
